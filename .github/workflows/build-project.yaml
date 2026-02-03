@@ -1,0 +1,217 @@
+name: Build ImageGlass
+
+on:
+  workflow_dispatch:
+    inputs:
+      dotnet_version:
+        description: '.NET version'
+        required: true
+        default: '10.0.x'
+        type: choice
+        options:
+          - '10.0.x'
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Debug
+          - Release
+      runtime:
+        description: 'Target runtime'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - win-x64
+          - win-arm64
+      self_contained:
+        description: 'Build self-contained executable'
+        required: true
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+        default: 'true'
+      create_release:
+        description: 'Create a GitHub release after build'
+        required: true
+        type: choice
+        default: 'false'
+        options:
+          - 'true'
+          - 'false'
+      release_tag:
+        description: 'Release tag (required if create_release is true)'
+        required: false
+        default: ''
+        type: string
+      release_name:
+        description: 'Release name'
+        required: false
+        default: 'ImageGlass Release'
+        type: string
+      release_notes:
+        description: 'Release notes'
+        required: false
+        default: 'Automated release from GitHub Actions'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        shell: bash
+        run: |
+          if [ "${{ inputs.runtime }}" == "all" ]; then
+            echo "matrix=[\"win-x64\", \"win-arm64\"]" >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[\"${{ inputs.runtime }}\"]" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: setup
+    name: Build ${{ inputs.configuration }} ${{ matrix.runtime }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: ${{ fromJson(needs.setup.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Print commit hash
+        run: |
+          git rev-parse HEAD
+          echo ${{ github.sha }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Restore dependencies
+        run: dotnet restore Source/ImageGlass/ImageGlass.csproj
+
+      - name: Build Project
+        run: |
+          dotnet build Source/ImageGlass/ImageGlass.csproj `
+            --configuration ${{ inputs.configuration }} `
+            --property:GitCommit=${{ github.sha }} `
+            /p:TargetFramework=net10.0-windows10.0.17763.0
+
+      - name: Publish application
+        shell: powershell
+        run: |
+          $selfContained = if ("${{ inputs.self_contained }}" -eq "true") { "--self-contained" } else { "--no-self-contained" }
+          $compression = if ("${{ inputs.self_contained }}" -eq "true") { "true" } else { "false" }
+          dotnet publish Source/ImageGlass/ImageGlass.csproj `
+            --configuration ${{ inputs.configuration }} `
+            --runtime ${{ matrix.runtime }} `
+            /p:GitCommit=${{ github.sha }} `
+            $selfContained `
+            --output publish `
+            /p:TargetFramework=net10.0-windows10.0.17763.0 `
+            /p:PublishSingleFile=true `
+            /p:EnableCompressionInSingleFile=$compression
+
+      - name: List published files
+        shell: powershell
+        run: |
+          Write-Host "=== Published Files ==="
+          Get-ChildItem -Path publish -Recurse -File | ForEach-Object {
+            Write-Host "$($_.FullName) - $($_.Length) bytes"
+          }
+
+      - name: Create Release Archive
+        if: inputs.create_release == 'true'
+        shell: powershell
+        run: |
+          $config = "${{ inputs.configuration }}"
+          $runtime = "${{ matrix.runtime }}"
+          $release_tag = "${{ inputs.release_tag }}"
+          
+          # Extract version from .csproj
+          [xml]$csproj = Get-Content Source/ImageGlass/ImageGlass.csproj
+          $version = $csproj.Project.PropertyGroup.Version | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+          
+          Write-Host "Detected project version: $version"
+          
+          # Use version if release_tag is empty, otherwise prefer release_tag
+          if ([string]::IsNullOrWhiteSpace($release_tag)) {
+              $release_tag = "v$version"
+          }
+          
+          $archiveName = "ImageGlass-${release_tag}-${config}-${runtime}.zip"
+          
+          Write-Host "Creating release archive: $archiveName"
+          
+          # Create archive with all published files
+          Compress-Archive -Path "publish\*" -DestinationPath $archiveName -Force
+          
+          Write-Host "Archive created successfully"
+          Write-Host "Archive contents:"
+          Get-ChildItem -Path publish -Recurse -File | ForEach-Object {
+            Write-Host "  $($_.Name)"
+          }
+          
+          # Save archive name to environment variable for later use
+          "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.configuration }}-${{ matrix.runtime }}
+          path: publish/
+          retention-days: 30
+
+      - name: Upload Release Archive
+        if: inputs.create_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive-${{ inputs.configuration }}-${{ matrix.runtime }}
+          path: ${{ env.ARCHIVE_NAME }}
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: inputs.create_release == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          body: ${{ inputs.release_notes }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/release-archive-*/ImageGlass-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
